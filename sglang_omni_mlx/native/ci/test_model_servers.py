@@ -773,14 +773,60 @@ def test_parakeet_final_request_returns_text_and_sentences(
     assert 0 <= segment["start"] < segment["end"] <= 3.1
 
 
+@pytest.mark.parametrize(
+    "fields", [{}, {"chunk_duration": "1200"}, {"chunk_duration": "30"}]
+)
+@pytest.mark.parametrize("stream", [False, True])
+def test_parakeet_final_keeps_speech_after_five_seconds(
+    parakeet_server: ModelServer, fields: dict[str, str], stream: bool
+) -> None:
+    """The five-second final windows silently dropped the spoken tail of this clip."""
+    audio = Path(__file__).resolve().parents[3] / "Voxt/testdata/eval/en-3.wav"
+    status, body = parakeet_server.post_form(
+        {**fields, "stream": str(stream).lower()}, audio.read_bytes()
+    )
+    assert status == 200
+    result = sse_events(body)[0] if stream else json.loads(body)
+    words = result["text"].lower().rstrip(".").split()
+    assert words[:3] == ["please", "remind", "me"]
+    assert words[-5:] == ["at", "nine", "in", "the", "morning"]
+    segments = result["segments"]
+    assert all(0 <= segment["start"] < segment["end"] <= 7.15 for segment in segments)
+    assert [segment["start"] for segment in segments] == sorted(
+        segment["start"] for segment in segments
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_parakeet_final_keeps_both_ends_across_automatic_chunks(
+    parakeet_server: ModelServer, stream: bool
+) -> None:
+    """A whole recording longer than 30 seconds uses the bounded final path."""
+    status, body = parakeet_server.post_form(
+        {"stream": str(stream).lower()}, clip("0344_en_long")
+    )
+    assert status == 200
+    result = sse_events(body)[0] if stream else json.loads(body)
+    assert result["text"].startswith(
+        "In every way they sought to undermine the authority"
+    )
+    assert "neither by men nor by man" in result["text"].lower()
+    segments = result["segments"]
+    assert len(segments) > 1
+    assert all(0 <= segment["start"] < segment["end"] <= 64.4 for segment in segments)
+    assert [segment["start"] for segment in segments] == sorted(
+        segment["start"] for segment in segments
+    )
+
+
 def test_parakeet_merges_overlapping_chunks_into_sentences(
     parakeet_server: ModelServer,
 ) -> None:
-    # Note (Dayuxiaoshui): a whole-recording request decodes 5 s chunks that
-    # overlap by 1 s, as Voxt's Swift path does.
+    # Note (Dayuxiaoshui): a recording longer than chunk_duration decodes in
+    # chunks that overlap by 1 s; this clip is 64 s.
     status, body = parakeet_server.post_form(
         {
-            "chunk_duration": "1200",
+            "chunk_duration": "20",
             "stream": "true",
             "include_generation_metadata": "true",
         },
@@ -792,7 +838,9 @@ def test_parakeet_merges_overlapping_chunks_into_sentences(
         "In every way they sought to undermine the authority"
     )
     assert done["generation_metadata"]["finish_reason"] == "stop"
-    status, body = parakeet_server.post_form({}, clip("0344_en_long"))
+    status, body = parakeet_server.post_form(
+        {"chunk_duration": "20"}, clip("0344_en_long")
+    )
     assert status == 200
     segments = json.loads(body)["segments"]
     assert len(segments) > 1

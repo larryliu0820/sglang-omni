@@ -102,12 +102,15 @@ def run_benchmark(
 
 @pytest.fixture
 def stub_runtime_bin(stub_server_binary: Path, tmp_path: Path) -> Path:
-    """A runtime directory whose qwen3_asr_server runs the stub server."""
+    """A runtime directory whose ASR binaries run the stub server."""
     directory = tmp_path / "bin"
     directory.mkdir()
-    server = directory / "qwen3_asr_server"
-    server.write_text(f'#!/bin/sh\nexec {shlex.quote(str(stub_server_binary))} "$@"\n')
-    server.chmod(0o755)
+    for model_kind in ("qwen3_asr", "parakeet"):
+        server = directory / f"{model_kind}_server"
+        server.write_text(
+            f'#!/bin/sh\n# {model_kind}\nexec {shlex.quote(str(stub_server_binary))} "$@"\n'
+        )
+        server.chmod(0o755)
     return directory
 
 
@@ -399,11 +402,16 @@ def test_stop_server_fails_a_server_that_already_exited(exit_code: int) -> None:
 
 
 @pytest.mark.parametrize(
-    ("flags", "text"),
+    ("flags", "text", "model_kind"),
     [
-        (("--mode", "http"), "48000"),
-        (("--mode", "http", "--chunk-seconds", "1"), "16000 16000 16000"),
-        (("--mode", "realtime", "--speed", "20"), "48000"),
+        (("--mode", "http"), "48000", "qwen3_asr"),
+        (
+            ("--mode", "http", "--chunk-seconds", "1"),
+            "16000 16000 16000",
+            "qwen3_asr",
+        ),
+        (("--mode", "realtime", "--speed", "20"), "48000", "qwen3_asr"),
+        (("--model-kind", "parakeet", "--mode", "http"), "48000", "parakeet"),
     ],
 )
 def test_benchmark_measures_a_case_on_the_stub_server(
@@ -412,8 +420,9 @@ def test_benchmark_measures_a_case_on_the_stub_server(
     stub_runtime_bin: Path,
     flags: tuple[str, ...],
     text: str,
+    model_kind: str,
 ) -> None:
-    exit_code, _, result = run_benchmark(
+    exit_code, output, result = run_benchmark(
         monkeypatch, tmp_path, stub_runtime_bin, *flags, *STUB_KIND_FLAGS
     )
     assert exit_code == 0
@@ -424,6 +433,56 @@ def test_benchmark_measures_a_case_on_the_stub_server(
     assert result["recovery_matches_warmup"] is True
     assert result["server_exit_code"] == 0
     assert result["peak_footprint_bytes"] >= result["warmup_peak_footprint_bytes"] > 0
+    metadata = json.loads((output / "metadata.json").read_text())
+    assert metadata["arguments"]["model_kind"] == model_kind
+    assert (
+        metadata["binary_sha256"]
+        == hashlib.sha256(
+            (stub_runtime_bin / f"{model_kind}_server").read_bytes()
+        ).hexdigest()
+    )
+
+
+@pytest.mark.parametrize(
+    ("flags", "error"),
+    [
+        (("--mode", "realtime", "--languages", "en"), "requires --mode http"),
+        (("--mode", "http", "--languages", "zh"), "requires --languages en"),
+        (("--mode", "http"), "requires --languages en"),
+    ],
+)
+def test_parakeet_rejects_unsupported_cases_before_creating_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    flags: tuple[str, ...],
+    error: str,
+) -> None:
+    """An unsupported case must fail before loading a model or writing results."""
+    output = tmp_path / "results"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark_long_audio",
+            "--runtime-bin",
+            str(tmp_path / "missing-runtime"),
+            "--data-root",
+            str(tmp_path / "missing-data"),
+            "--model",
+            "owner/model",
+            "--model-kind",
+            "parakeet",
+            "--output",
+            str(output),
+            *flags,
+        ],
+    )
+    with pytest.raises(SystemExit) as stopped:
+        benchmark_long_audio.main()
+    assert stopped.value.code == 2
+    assert error in capsys.readouterr().err
+    assert not output.exists()
 
 
 def test_a_failed_shutdown_fails_a_measured_case(

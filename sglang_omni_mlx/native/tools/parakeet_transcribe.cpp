@@ -5,6 +5,7 @@
 //   parakeet_transcribe --model-path DIR [--chunk-duration S] a.wav...
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -39,6 +40,16 @@ int main(int argc, char **argv) {
       files.push_back(argument);
     }
   }
+  if (!std::isfinite(options.chunk_duration_seconds) ||
+      options.chunk_duration_seconds < 2.0 ||
+      (options.chunk_duration_seconds > 300.0 &&
+       options.chunk_duration_seconds < 1199.0)) {
+    std::cerr << argv[0]
+              << ": chunk_duration must be 2 to 300 seconds, or 1199 or more "
+                 "for a whole recording\n";
+    return 2;
+  } else {
+  }
   const auto load_started = std::chrono::steady_clock::now();
   const parakeet::ParakeetTranscriber transcriber(model_path);
   std::cerr << "loaded in "
@@ -51,6 +62,7 @@ int main(int argc, char **argv) {
     std::ifstream stream(file, std::ios::binary);
     std::ostringstream bytes;
     bytes << stream.rdbuf();
+    mlx::core::reset_peak_memory();
     const auto started = std::chrono::steady_clock::now();
     const qwen3_asr::TranscriptionResult result = transcriber.Transcribe(
         omni_common::DecodeWav(bytes.str()), options, cancel);
@@ -64,8 +76,14 @@ int main(int argc, char **argv) {
         {"seconds", std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - started)
                         .count()},
+        {"peak_active_bytes", mlx::core::get_peak_memory()},
+        {"active_bytes", mlx::core::get_active_memory()},
+        {"cache_bytes", mlx::core::get_cache_memory()},
     };
     std::cout << line.dump() << std::endl;
+    // Note (Mengwei Liu): mirror the server's idle cleanup between files.
+    mlx::core::synchronize();
+    mlx::core::clear_cache();
   }
   return 0;
 }
